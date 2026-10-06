@@ -1,0 +1,1913 @@
+# -*- coding: utf-8 -*-
+"""
+Tanishuv bot (anonim suhbat)  -  python-telegram-bot 22.5
+
+O'rnatish:        pip install python-telegram-bot==22.5
+Ishga tushirish:  BOT_TOKEN=... ADMIN_IDS=123,456 python bot.py
+(yoki pastdagi BOT_TOKEN va ADMIN_IDS ni to'g'ridan-to'g'ri yozing)
+"""
+import asyncio
+import html
+import json
+import logging
+import math
+import os
+import re
+import sqlite3
+import time
+from datetime import datetime, timedelta, timezone
+
+from telegram import (CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+                      LabeledPrice, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update)
+from telegram.constants import ParseMode
+from telegram.ext import (ApplicationBuilder, ApplicationHandlerStop, CallbackQueryHandler,
+                          CommandHandler, MessageHandler, PreCheckoutQueryHandler, TypeHandler,
+                          filters)
+
+# ============================ SOZLAMALAR ============================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8749723340:AAHlVnklYY7z0EisiLfYZ_5WLU54budzHUc")
+ADMIN_IDS = [int(i) for i in os.getenv("ADMIN_IDS", "7878811146").split(",") if i.strip()]
+DB_FILE = os.getenv("DB_FILE", "tanishuv.db")  # boshqa botning bot.db fayli bilan aralashmasligi uchun
+MIN_AGE = 18
+CLEAN_CHAT = False          # False: bot hech qanday xabarni o'chirmaydi (faqat quyidagi oferta)
+DELETE_OFFER = True         # True: «Roziman» bosilgach oferta xabari o'chadi, False: qoladi
+MIN_TOPUP = 1000
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
+HTML = ParseMode.HTML
+UZ = timezone(timedelta(hours=5))
+GENDER = {"yigit": "👦 Yigit", "qiz": "👧 Qiz"}
+
+# ============================== BAZA ================================
+db = sqlite3.connect(DB_FILE, check_same_thread=False)
+db.row_factory = sqlite3.Row
+db.executescript("""
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY, name TEXT, age INTEGER, gender TEXT, photo TEXT, region TEXT,
+  username TEXT, tg_name TEXT, balance INTEGER DEFAULT 0, deposited INTEGER DEFAULT 0,
+  referrer INTEGER, ref_credited INTEGER DEFAULT 0, ref_count INTEGER DEFAULT 0,
+  ref_batches INTEGER DEFAULT 0, vip_until REAL DEFAULT 0, link_until REAL DEFAULT 0,
+  ads_off INTEGER DEFAULT 0, banned INTEGER DEFAULT 0, chat_count INTEGER DEFAULT 0,
+  offer INTEGER DEFAULT 0, registered INTEGER DEFAULT 0, last_partner INTEGER, created REAL);
+CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS channels(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, title TEXT, link TEXT);
+CREATE TABLE IF NOT EXISTS cards(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, owner TEXT, number TEXT);
+CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER,
+  file_id TEXT, status TEXT DEFAULT 'new', created REAL);
+CREATE TABLE IF NOT EXISTS promos(code TEXT PRIMARY KEY, uses_left INTEGER, expires REAL, kind TEXT, value INTEGER);
+CREATE TABLE IF NOT EXISTS promo_used(code TEXT, user_id INTEGER, PRIMARY KEY(code, user_id));
+CREATE TABLE IF NOT EXISTS complaints(id INTEGER PRIMARY KEY AUTOINCREMENT, complainant INTEGER, reported INTEGER,
+  text TEXT, file_id TEXT, status TEXT DEFAULT 'new', created REAL);
+CREATE TABLE IF NOT EXISTS ref_log(referrer INTEGER, ts REAL);
+""")
+db.commit()
+
+
+def q(sql, a=(), one=False):
+    cur = db.execute(sql, a)
+    return cur.fetchone() if one else cur.fetchall()
+
+
+def x(sql, a=()):
+    cur = db.execute(sql, a)
+    db.commit()
+    return cur
+
+
+def S(k, d=None):
+    r = q("SELECT v FROM settings WHERE k=?", (k,), True)
+    return r["v"] if r else d
+
+
+def SI(k, d=0):
+    try:
+        return int(S(k, d))
+    except (TypeError, ValueError):
+        return d
+
+
+def setS(k, v):
+    x("INSERT OR REPLACE INTO settings(k, v) VALUES(?, ?)", (k, str(v)))
+
+
+def U(uid):
+    return q("SELECT * FROM users WHERE id=?", (uid,), True)
+
+
+def ensure_user(update):
+    tu = update.effective_user
+    if not tu:
+        return None
+    if not U(tu.id):
+        x("INSERT INTO users(id, created) VALUES(?, ?)", (tu.id, time.time()))
+    x("UPDATE users SET username=?, tg_name=? WHERE id=?", (tu.username, tu.full_name, tu.id))
+    return U(tu.id)
+
+
+# ========================== YORDAMCHI FUNKSIYALAR ====================
+def fdate(ts):
+    return datetime.fromtimestamp(ts, UZ).strftime("%d.%m.%Y %H:%M")
+
+
+def money(n):
+    return f"{int(n):,}".replace(",", " ")
+
+
+def esc(s):
+    return html.escape(str(s if s is not None else ""))
+
+
+def num(text):
+    d = re.sub(r"\D", "", text or "")
+    return int(d) if d else None
+
+
+def vip_on(u):
+    return bool(u) and (u["id"] in ADMIN_IDS or (u["vip_until"] or 0) > time.time())
+
+
+def link_on(u):
+    return bool(u) and (u["id"] in ADMIN_IDS or (u["link_until"] or 0) > time.time())
+
+
+def add_days(uid, col, days):
+    assert col in ("vip_until", "link_until")
+    u = U(uid)
+    base = max(u[col] or 0, time.time())
+    x(f"UPDATE users SET {col}=? WHERE id=?", (base + days * 86400, uid))
+
+
+def user_link(u):
+    if u["username"]:
+        return "@" + esc(u["username"])
+    return f'<a href="tg://user?id={u["id"]}">{esc(u["name"] or u["tg_name"] or "Profil")}</a>'
+
+
+REGIONS = {
+    "Toshkent shahri": (41.311, 69.279), "Toshkent viloyati": (41.0, 69.9), "Sirdaryo": (40.5, 68.8),
+    "Jizzax": (40.12, 67.84), "Samarqand": (39.65, 66.96), "Buxoro": (39.77, 64.42),
+    "Navoiy": (40.1, 65.37), "Qashqadaryo": (38.86, 65.79), "Surxondaryo": (37.9, 67.6),
+    "Xorazm": (41.55, 60.63), "Qoraqalpog'iston": (43.0, 59.0), "Farg'ona": (40.38, 71.78),
+    "Andijon": (40.78, 72.34), "Namangan": (41.0, 71.67),
+}
+
+
+def region_of(lat, lon):
+    def hav(a1, o1, a2, o2):
+        p1, p2 = math.radians(a1), math.radians(a2)
+        h = (math.sin((p2 - p1) / 2) ** 2
+             + math.cos(p1) * math.cos(p2) * math.sin(math.radians(o2 - o1) / 2) ** 2)
+        return 6371 * 2 * math.asin(math.sqrt(h))
+    best = min(((hav(lat, lon, a, b), n) for n, (a, b) in REGIONS.items()))
+    return best[1] if best[0] < 600 else "Boshqa davlat"
+
+
+RE_USER = re.compile(r"@\w{3,}")
+RE_LINK = re.compile(r"(https?://|www\.|t\.me|telegram\.(me|dog)|tg://|joinchat|"
+                     r"\b\w+\.(com|uz|me|ru|org|net|io|info|ly|xyz|link|su)\b)", re.I)
+
+
+RE_AD = re.compile(r"(obuna\s*bo'?l|kanalimiz|guruhimiz|kanalga\s*(kir|qo'shil|a'zo)|guruhga\s*(kir|qo'shil)|"
+                   r"reklama|instagram|\binsta\b|подпиш|наш\s*канал|наша\s*группа|pul\s*ishla)", re.I)
+
+
+def forbidden(text):
+    """username, havola, guruh/kanal linki, reklama yoki telefon raqam bormi"""
+    if RE_USER.search(text) or RE_LINK.search(text) or RE_AD.search(text):
+        return True
+    digits = re.sub(r"[\s\-().+_,]", "", text)
+    return bool(re.search(r"\d{7,}", digits))
+
+
+# ============================== TUGMALAR =============================
+M_SEARCH = "🔍 Qidiruv"
+M_BOY = "👦 Yigit bola izlash"
+M_GIRL = "👧 Qiz bola izlash"
+M_ACC = "💰 Hisobim"
+M_FORM = "📝 Anketam"
+M_PROF = "👤 Profilim"
+M_TOP = "💳 Hisob to'ldirish"
+M_REF = "🎁 Referal"
+M_PROMO = "🎟 Promo kod"
+M_STOP = "⛔ Suhbatni yakunlash"
+
+M_ADMIN = "🛠 Admin panel"
+M_CANCEL = "❌ Bekor qilish"
+USER_ROWS = [[M_SEARCH], [M_BOY, M_GIRL], [M_ACC, M_FORM], [M_PROF, M_TOP], [M_REF, M_PROMO]]
+
+
+# ---- Premium (custom) emoji: reply tugmalarda ----
+def emap():
+    try:
+        return json.loads(S("emoji_map", "{}"))
+    except ValueError:
+        return {}
+
+
+def shown(label, em):
+    """Premium emoji qo'yilgan tugmada oddiy emoji olib tashlanadi (ikonka o'rniga chiqadi)."""
+    if label not in em:
+        return label
+    return re.sub(r"^[^\w]+", "", label) or label
+
+
+def canon(text):
+    """Tugmada ko'rinadigan matnni asl (kanonik) nomiga qaytaradi."""
+    em = emap()
+    for lab in em:
+        if shown(lab, em) == text:
+            return lab
+    return text
+
+
+def kbtn(label, **kw):
+    em = emap()
+    if label in em:
+        return KeyboardButton(shown(label, em), api_kwargs={"icon_custom_emoji_id": em[label]}, **kw)
+    return KeyboardButton(label, **kw)
+
+
+def RK(rows, **kw):
+    return ReplyKeyboardMarkup([[kbtn(b) if isinstance(b, str) else b for b in r] for r in rows],
+                               resize_keyboard=True, **kw)
+
+
+def strip_icons(kb):
+    """Telegram premium ikonkani qabul qilmasa, tugmalarni ikonkasiz qayta yasaydi."""
+    rows = [[KeyboardButton(b.text, request_location=b.request_location or None) for b in r]
+            for r in kb.keyboard]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=kb.one_time_keyboard)
+
+
+async def icon_error(ctx, e):
+    """Premium ikonka qabul qilinmasa, adminga sababini bildiradi (10 daqiqada bir marta)."""
+    if time.time() - ctx.bot_data.get("icon_err_ts", 0) < 600:
+        return
+    ctx.bot_data["icon_err_ts"] = time.time()
+    for a in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(a, "⚠️ Tugmalar premium emoji bilan yuborilmadi, ikonkasiz yuborildi.\n"
+                                          f"Telegram sababi: {e}")
+        except Exception:
+            pass
+
+
+def stop_kb():
+    return RK([[M_STOP]])
+
+
+def cancel_kb():
+    return RK([[M_CANCEL]])
+
+
+def UM(uid):
+    """User menyusi. Admin uchun pastiga 'Admin panel' tugmasi ham qo'shiladi."""
+    return RK(USER_ROWS + ([[M_ADMIN]] if uid in ADMIN_IDS else []))
+
+def loc_kb(cancel=False):
+    rows = [[kbtn("📍 Joylashuvni yuborish", request_location=True)]]
+    if cancel:
+        rows.append([M_CANCEL])
+    return RK(rows, one_time_keyboard=not cancel)
+
+
+def btn(t, d):
+    if d.startswith("url:"):
+        return InlineKeyboardButton(t, url=d[4:])
+    if d.startswith("copy:"):
+        return InlineKeyboardButton(t, copy_text=CopyTextButton(text=d[5:]))
+    return InlineKeyboardButton(t, callback_data=d)
+
+
+def ikb(rows):
+    return InlineKeyboardMarkup([[btn(t, d) for t, d in r] for r in rows])
+
+
+# ======================= TOZA CHAT (eski xabarlarni o'chirish) =======
+async def clear_last(ctx, uid, slots=(0, 1)):
+    last = ctx.bot_data["last"]
+    for s in slots:
+        mid = last.pop((uid, s), None)
+        if mid and CLEAN_CHAT:
+            try:
+                await ctx.bot.delete_message(uid, mid)
+            except Exception:
+                pass
+
+
+async def say(ctx, uid, text, kb=None, photo=None, slot=0, track=True):
+    """Oldingi bot xabarini o'chirib, yangisini yuboradi."""
+    if track:
+        await clear_last(ctx, uid, (0, 1) if slot == 0 else (1,))
+    m = None
+    try:
+        if photo:
+            m = await ctx.bot.send_photo(uid, photo, caption=text, reply_markup=kb, parse_mode=HTML)
+    except Exception as e:
+        logging.warning("photo send failed %s: %s", uid, e)
+    try:
+        if m is None:
+            m = await ctx.bot.send_message(uid, text, reply_markup=kb, parse_mode=HTML)
+    except Exception as e:
+        m = None
+        if isinstance(kb, ReplyKeyboardMarkup):
+            try:
+                m = await ctx.bot.send_message(uid, text, reply_markup=strip_icons(kb), parse_mode=HTML)
+                if emap():  # ikonkasiz yuborish ishladi, demak muammo premium ikonkada edi
+                    logging.warning("premium ikonkali klaviatura yuborilmadi %s: %s", uid, e)
+                    await icon_error(ctx, e)
+            except Exception as e2:
+                logging.warning("send failed %s: %s", uid, e2)
+        else:
+            logging.warning("send failed %s: %s", uid, e)
+        if m is None:
+            return None
+    if track:
+        ctx.bot_data["last"][(uid, slot)] = m.message_id
+    return m
+
+
+async def eat(update):
+    """CLEAN_CHAT yoqilgan bo'lsagina foydalanuvchi xabarini o'chiradi."""
+    if not CLEAN_CHAT:
+        return
+    try:
+        if update.callback_query:
+            await update.callback_query.message.delete()
+        elif update.message:
+            await update.message.delete()
+    except Exception:
+        pass
+
+
+# ================= MAJBURIY OBUNA, REFERAL, RO'YXATDAN O'TISH =========
+OFFER_TEXT = (
+    "📜 <b>Foydalanish qoidalari (oferta)</b>\n\n"
+    "1. Botdan faqat 18 yoshdan oshganlar foydalana oladi.\n"
+    "2. Haqorat, tahdid, voyaga yetmaganlarga nisbatan har qanday noqonuniy harakatlar va "
+    "boshqa qonunbuzarliklar taqiqlanadi, tegishli choralar ko'riladi.\n"
+    "3. Suhbatda reklama, havola, username va telefon raqam yuborish taqiqlanadi.\n"
+    "4. Qoidabuzarlar bloklanadi.\n\n"
+    "«Roziman» tugmasini bosish orqali ushbu qoidalarga rozilik bildirasiz."
+)
+REG_PROMPT = {
+    "reg_name": "📝 Ismingizni yozing:",
+    "reg_age": f"🎂 Yoshingizni yozing ({MIN_AGE}+):",
+    "reg_photo": "📸 Profil rasmingizni yuboring:",
+    "reg_loc": "📍 Pastdagi tugma orqali joylashuvingizni yuboring (viloyatingiz shundan aniqlanadi):",
+}
+
+
+async def not_joined(ctx, uid):
+    res = []
+    for c in q("SELECT * FROM channels"):
+        try:
+            m = await ctx.bot.get_chat_member(c["chat_id"], uid)
+            if m.status in ("left", "kicked"):
+                res.append(c)
+        except Exception:
+            pass  # bot kanalda admin emas yoki kanal topilmadi: o'tkazib yuboramiz
+    return res
+
+
+async def gate(ctx, uid):
+    """VIP/link bor bo'lsa yoki hamma kanalga obuna bo'lsa True."""
+    u = U(uid)
+    if vip_on(u) or link_on(u):
+        return True
+    miss = await not_joined(ctx, uid)
+    if not miss:
+        return True
+    rows = [[(f"📢 {c['title']}", "url:" + c["link"])] for c in miss]
+    rows.append([("✅ Tekshirish", "chk")])
+    await say(ctx, uid, "📢 Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling, "
+                        "so'ng «Tekshirish» tugmasini bosing:", ikb(rows))
+    return False
+
+
+async def credit_referral(ctx, uid):
+    u = U(uid)
+    r = u["referrer"]
+    if not r or u["ref_credited"] or not u["registered"]:
+        return
+    x("UPDATE users SET ref_credited=1 WHERE id=?", (uid,))
+    x("UPDATE users SET ref_count=ref_count+1 WHERE id=?", (r,))
+    x("INSERT INTO ref_log(referrer, ts) VALUES(?, ?)", (r, time.time()))
+    ru = U(r)
+    batches = ru["ref_count"] // 10
+    new = batches - ru["ref_batches"]
+    msg = f"👥 Do'stingiz botga qo'shildi! Jami takliflaringiz: {ru['ref_count']} ta."
+    if new > 0:
+        x("UPDATE users SET ref_batches=? WHERE id=?", (batches, r))
+        add_days(r, "vip_until", 2 * new)
+        add_days(r, "link_until", 2 * new)
+        msg += f"\n🎉 Sizga {2 * new} kunlik VIP va link obunasi berildi!"
+    try:
+        await ctx.bot.send_message(r, msg)
+    except Exception:
+        pass
+
+
+async def main_menu(ctx, uid, text="🏠 Asosiy menyu"):
+    await say(ctx, uid, text, UM(uid))
+
+
+async def reg_start(ctx, uid, again=False):
+    ctx.user_data["flow"] = {"k": "reg_name", "again": again}
+    await say(ctx, uid, REG_PROMPT["reg_name"], cancel_kb() if again else ReplyKeyboardRemove())
+
+
+async def need_reg(ctx, uid):
+    u = U(uid)
+    if not u["offer"]:
+        await say(ctx, uid, OFFER_TEXT, ikb([[("✅ Roziman", "offer")]]), track=False)
+    else:
+        await reg_start(ctx, uid)
+
+
+def block_text():
+    a = S("admin_username")
+    who = ("@" + a.lstrip("@")) if a else "admin"
+    return ("🚫 <b>Siz bloklangansiz.</b>\n\nShikoyatni olib tashlash uchun adminga murojaat "
+            f"qiling: {esc(who)}")
+
+
+async def cmd_start(update, ctx):
+    uid = update.effective_user.id
+    u = ensure_user(update)
+    await eat(update)
+    if uid in ctx.bot_data["pairs"]:
+        await ctx.bot.send_message(uid, "💬 Siz hozir suhbatdasiz. Yakunlash uchun /stop bosing.")
+        return
+    ctx.user_data.pop("flow", None)
+    if uid in ADMIN_IDS and not u["registered"]:
+        return await say(ctx, uid, "👑 <b>Siz adminsiz.</b>\n\nIstasangiz, ro'yxatdan o'ting.",
+                         ikb([[("📝 Ro'yxatdan o'tish", "adm_reg"), ("⏭ Tashlab ketish", "adm_skip")]]))
+    if ctx.args and ctx.args[0].startswith("ref_") and not u["referrer"] and not u["registered"]:
+        try:
+            r = int(ctx.args[0][4:])
+        except ValueError:
+            r = 0
+        if r and r != uid and U(r):
+            x("UPDATE users SET referrer=? WHERE id=?", (r, uid))
+    if not u["offer"]:
+        await say(ctx, uid, OFFER_TEXT, ikb([[("✅ Roziman", "offer")]]), track=False)
+    elif not u["registered"]:
+        await reg_start(ctx, uid)
+    elif await gate(ctx, uid):
+        await main_menu(ctx, uid)
+
+
+async def user_flow(update, ctx, fl):
+    """Foydalanuvchining matn/rasm/lokatsiya kutayotgan holatlari."""
+    m = update.message
+    uid = update.effective_user.id
+    k = fl["k"]
+    text = canon((m.text or "").strip())
+    await eat(update)
+
+    async def again(msg=""):
+        await say(ctx, uid, (msg + "\n\n" if msg else "") + REG_PROMPT[k],
+                  loc_kb(fl.get("again")) if k == "reg_loc" else None)
+
+    if k == "reg_name":
+        if not text or len(text) > 30:
+            return await again("❌ Ism 1-30 ta belgidan iborat bo'lishi kerak.")
+        fl["name"], fl["k"] = text, "reg_age"
+        return await say(ctx, uid, REG_PROMPT["reg_age"])
+    if k == "reg_age":
+        if not text.isdigit():
+            return await again("❌ Yoshni raqam bilan yozing.")
+        age = int(text)
+        if age < MIN_AGE:
+            return await again(f"🔞 Botdan faqat {MIN_AGE} yoshdan oshganlar foydalana oladi.")
+        if age > 99:
+            return await again("❌ Yoshni to'g'ri kiriting.")
+        fl["age"], fl["k"] = age, "reg_gender"
+        return await say(ctx, uid, "⚧ Jinsingizni tanlang:",
+                         ikb([[("👦 Yigit", "g:yigit"), ("👧 Qiz", "g:qiz")]]))
+    if k == "reg_gender":
+        return await say(ctx, uid, "⚧ Jinsingizni tanlang:",
+                         ikb([[("👦 Yigit", "g:yigit"), ("👧 Qiz", "g:qiz")]]))
+    if k == "reg_photo":
+        if not m.photo:
+            return await again("❌ Iltimos, rasm yuboring.")
+        fl["photo"], fl["k"] = m.photo[-1].file_id, "reg_loc"
+        return await say(ctx, uid, REG_PROMPT["reg_loc"], loc_kb(fl.get("again")))
+    if k == "reg_loc":
+        if not m.location:
+            return await again("❌ Pastdagi tugma orqali joylashuvni yuboring.")
+        region = region_of(m.location.latitude, m.location.longitude)
+        x("UPDATE users SET name=?, age=?, gender=?, photo=?, region=?, registered=1 WHERE id=?",
+          (fl["name"], fl["age"], fl["gender"], fl["photo"], region, uid))
+        ctx.user_data.pop("flow", None)
+        if fl.get("again"):
+            return await main_menu(ctx, uid, "✅ Anketangiz yangilandi.")
+        if await gate(ctx, uid):
+            await credit_referral(ctx, uid)
+            await main_menu(ctx, uid, "✅ Ro'yxatdan o'tdingiz!")
+        return
+
+    if k == "topup_method":
+        if text == "💳 Karta":
+            return await ask_amount(ctx, uid, "card")
+        if text == "⭐ Stars":
+            return await ask_amount(ctx, uid, "stars")
+        return await u_topup(ctx, uid)
+    if k == "topup_amt":
+        amt = num(text)
+        if not amt or amt < MIN_TOPUP:
+            return await say(ctx, uid, f"❌ Minimal summa {money(MIN_TOPUP)} so'm. Summani qayta kiriting:")
+        if amt > 100_000_000:
+            return await say(ctx, uid, "❌ Summa juda katta. Qayta kiriting:")
+        ctx.user_data.pop("flow", None)
+        if fl["m"] == "card":
+            return await show_card(ctx, uid, amt)
+        return await send_stars_invoice(ctx, uid, amt)
+    if k == "receipt":
+        if not m.photo:
+            return await say(ctx, uid, "❌ Chekni rasm (skrinshot) ko'rinishida yuboring.")
+        ctx.user_data.pop("flow", None)
+        cur = x("INSERT INTO payments(user_id, amount, file_id, created) VALUES(?, ?, ?, ?)",
+                (uid, fl["amount"], m.photo[-1].file_id, time.time()))
+        await say(ctx, uid, "⏳ Chek tekshirilmoqda. Tasdiqlangach hisobingizga mablag' qo'shiladi.", UM(uid))
+        return await push_payment(ctx, cur.lastrowid)
+    if k == "promo_in":
+        ctx.user_data.pop("flow", None)
+        return await redeem(ctx, uid, text.upper())
+    if k == "complaint":
+        if m.photo:
+            fid, txt = m.photo[-1].file_id, (m.caption or "")[:700]
+        elif text:
+            fid, txt = None, text[:800]
+        else:
+            return await say(ctx, uid, "❌ Matn yozing yoki screenshot yuboring.")
+        ctx.user_data.pop("flow", None)
+        rep = fl["rep"]
+        x("INSERT INTO complaints(complainant, reported, text, file_id, created) VALUES(?, ?, ?, ?, ?)",
+          (uid, rep, txt, fid, time.time()))
+        n = q("SELECT COUNT(DISTINCT complainant) c FROM complaints WHERE reported=? AND status!='rejected'",
+              (rep,), True)["c"]
+        if n >= 3 and not U(rep)["banned"]:
+            await ban_user(ctx, rep)  # avto-ban
+        return await main_menu(ctx, uid, "✅ Shikoyatingiz qabul qilindi. Tekshirilgach javob beramiz.")
+
+
+# ===================== FOYDALANUVCHI MENYULARI =======================
+def sub_text(kind):
+    p, d = SI(kind + "_price"), SI(kind + "_days")
+    price = f"{money(p)} so'm / {d} kun" if p > 0 and d > 0 else "hali belgilanmagan"
+    if kind == "vip":
+        return ("💎 <b>VIP obuna</b>\n\n• Jins bo'yicha qidiruv: yigit yoki qiz bola izlash\n"
+                "• Majburiy kanallarga obuna bo'lmasdan foydalanish\n• Reklamasiz ishlash\n\n"
+                f"💰 Narxi: <b>{price}</b>")
+    return ("🔗 <b>Link obuna</b>\n\nSuhbatdoshning ma'lumotlarini ko'rish: Telegram lichkasi, yoshi, "
+            f"profil rasmi, viloyati va ismi.\n\n💰 Narxi: <b>{price}</b>")
+
+
+SUB_KB = [[("💎 VIP sotib olish", "buy:vip")], [("🔗 Link sotib olish", "buy:link")],
+          [("🎁 Tekinga olish", "free")]]
+
+
+async def buy(ctx, uid, kind):
+    p, d = SI(kind + "_price"), SI(kind + "_days")
+    name = "VIP" if kind == "vip" else "Link"
+    if p <= 0 or d <= 0:
+        return await say(ctx, uid, "❌ Bu obunaning narxi hali belgilanmagan.", UM(uid))
+    u = U(uid)
+    if u["balance"] < p:
+        return await say(ctx, uid, "❌ Hisobingizda yetarli mablag' yo'q. "
+                                   f"Yana <b>{money(p - u['balance'])}</b> so'm yetishmayapti.",
+                         ikb([[("💳 Hisob to'ldirish", "topup")]]))
+    x("UPDATE users SET balance=balance-? WHERE id=?", (p, uid))
+    add_days(uid, kind + "_until", d)
+    u = U(uid)
+    await say(ctx, uid, f"✅ {name} obuna faollashtirildi!\n📅 {fdate(u[kind + '_until'])} gacha.", UM(uid))
+
+
+async def ref_link(ctx, uid):
+    return f"https://t.me/{ctx.bot.username}?start=ref_{uid}"
+
+
+async def show_free(ctx, uid):
+    link = await ref_link(ctx, uid)
+    await say(ctx, uid,
+              "🎁 <b>Tekinga olish</b>\n\n"
+              "Hurmatli mijoz, tekinga olish degani hech narsa qilmasdan olish degani emas.\n\n"
+              "Agar siz botimizga 10 ta do'stingizni referal havolangiz orqali taklif qilsangiz va "
+              "do'stlaringiz bot taqdim etgan kanallarga obuna bo'lsa, sizga <b>2 kunlik VIP va link</b> "
+              "obunasi taqdim etiladi.\n\n"
+              "Har keyingi 10 ta do'st uchun yana 2 kunlik obuna beriladi. 10 tadan ortiq taklif qilgan "
+              "do'stlaringiz keyingi 10 ta uchun avtomatik yig'ilib boradi.\n\n"
+              f"🔗 Sizning referal havolangiz:\n{link}",
+              ikb([[("📋 Havolani nusxalash", "copy:" + link)]]))
+
+
+async def u_acc(ctx, uid):
+    u = U(uid)
+    await say(ctx, uid, "💰 <b>Hisobim</b>\n\n"
+                        f"💵 Mablag'ingiz: <b>{money(u['balance'])}</b> so'm\n"
+                        f"👥 Referallar soni: <b>{u['ref_count']}</b> ta\n"
+                        f"📥 Botga kiritgan jami summa: <b>{money(u['deposited'])}</b> so'm",
+              ikb([[("💳 Hisob to'ldirish", "topup")]]))
+
+
+async def u_form(ctx, uid):
+    await reg_start(ctx, uid, again=True)
+
+
+async def u_prof(ctx, uid):
+    u = U(uid)
+    v = f"✅ {fdate(u['vip_until'])} gacha" if vip_on(u) else "❌ yo'q"
+    l = f"✅ {fdate(u['link_until'])} gacha" if link_on(u) else "❌ yo'q"
+    if uid in ADMIN_IDS:
+        v = l = "♾ Cheksiz"
+    cap = (f"👤 <b>Profilim</b>\n\n📛 Ism: {esc(u['name'])}\n🎂 Yosh: {u['age']}\n"
+           f"⚧ Jins: {GENDER.get(u['gender'], '-')}\n🌍 Viloyat: {esc(u['region'])}\n"
+           f"💬 Jami suhbat: {u['chat_count']} ta odam bilan\n\n💎 VIP: {v}\n🔗 Link: {l}")
+    await say(ctx, uid, cap, UM(uid), photo=u["photo"])
+
+
+def week_start(ts=None):
+    dt = datetime.fromtimestamp(ts or time.time(), UZ)
+    return (dt - timedelta(days=dt.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def weekly_top(since, until=None, limit=10):
+    until = until or time.time() + 1
+    return q("SELECT r.referrer, COUNT(*) c, u.name FROM ref_log r JOIN users u ON u.id=r.referrer "
+             "WHERE r.ts>=? AND r.ts<? GROUP BY r.referrer ORDER BY c DESC LIMIT ?", (since, until, limit))
+
+
+def prize_text():
+    p = [SI("prize_1"), SI("prize_2"), SI("prize_3")]
+    if not any(p):
+        return "Haftalik sovrin hali belgilanmagan."
+    return "🎁 Haftalik sovrin (VIP + link): " + ", ".join(
+        f"{i}-o'rin {d} kun" for i, d in enumerate(p, 1) if d)
+
+
+async def u_ref(ctx, uid):
+    u = U(uid)
+    link = await ref_link(ctx, uid)
+    rows = weekly_top(week_start())
+    top = "\n".join(f"{i}. {esc(r['name'])} — {r['c']} ta" for i, r in enumerate(rows, 1))
+    await say(ctx, uid,
+              "🎁 <b>Referal</b>\n\n"
+              f"👥 Taklif qilgan do'stlaringiz: <b>{u['ref_count']}</b> ta "
+              f"(keyingi mukofotgacha: {u['ref_count'] % 10}/10)\n\n"
+              f"🔗 Sizning havolangiz:\n{link}\n\n"
+              f"🏆 <b>Shu haftaning reytingi (top 10)</b>\n{top or 'Hozircha reyting bo`sh.'}\n\n"
+              f"{prize_text()}\nReyting har dushanba yangilanadi va g'oliblarga sovrin avtomatik beriladi.",
+              ikb([[("📋 Havolani nusxalash", "copy:" + link)], [("🎁 Tekinga olish", "free")]]))
+
+
+async def u_promo(ctx, uid):
+    ctx.user_data["flow"] = {"k": "promo_in"}
+    await say(ctx, uid, "🎟 Promo kodni yozing:", cancel_kb())
+
+
+async def redeem(ctx, uid, code):
+    p = q("SELECT * FROM promos WHERE code=?", (code,), True)
+    if not p:
+        return await say(ctx, uid, "❌ Bunday promo kod topilmadi.", UM(uid))
+    if p["expires"] < time.time():
+        return await say(ctx, uid, "⏰ Bu promo kodning muddati tugagan.", UM(uid))
+    if p["uses_left"] <= 0:
+        return await say(ctx, uid, "❌ Bu promo kod tugagan.", UM(uid))
+    if q("SELECT 1 FROM promo_used WHERE code=? AND user_id=?", (code, uid), True):
+        return await say(ctx, uid, "❌ Siz bu promo kodni allaqachon ishlatgansiz.", UM(uid))
+    x("UPDATE promos SET uses_left=uses_left-1 WHERE code=?", (code,))
+    x("INSERT INTO promo_used(code, user_id) VALUES(?, ?)", (code, uid))
+    if p["kind"] == "amount":
+        x("UPDATE users SET balance=balance+? WHERE id=?", (p["value"], uid))
+        t = f"💵 Hisobingizga {money(p['value'])} so'm qo'shildi."
+    elif p["kind"] == "vip":
+        add_days(uid, "vip_until", p["value"])
+        t = f"💎 Sizga {p['value']} kunlik VIP berildi."
+    else:
+        add_days(uid, "link_until", p["value"])
+        t = f"🔗 Sizga {p['value']} kunlik link obunasi berildi."
+    await say(ctx, uid, "✅ <b>Promo kod qabul qilindi!</b>\n" + t, UM(uid))
+
+
+# ---- /vip /link /settings /rules ----
+async def show_sub(ctx, uid, kind):
+    await say(ctx, uid, sub_text(kind), ikb(SUB_KB))
+
+
+async def show_settings(ctx, uid):
+    u = U(uid)
+    st = "o'chirilgan 🔕" if u["ads_off"] else "yoqilgan 🔔"
+    t = ("⚙️ <b>Sozlamalar</b>\n\nHurmatli mijoz, sizda VIP yoki link obunasi faol bo'lsa, botdan "
+         "kanallarga obuna bo'lmasdan va reklama xabarlaridan xalos bo'lib foydalana olasiz.\n\n"
+         f"📣 Reklama: {st}")
+    b = ("🔔 Reklamani yoqish", "adtog") if u["ads_off"] else ("🔕 Reklamani o'chirish", "adtog")
+    await say(ctx, uid, t, ikb([[b]]))
+
+
+async def toggle_ads(ctx, uid):
+    u = U(uid)
+    if not (vip_on(u) or link_on(u)):
+        return await say(ctx, uid, "❌ Sizda VIP yoki link obunasi yo'q.",
+                         ikb([[("💎 VIP sotib olish", "buy:vip")], [("🔗 Link sotib olish", "buy:link")]]))
+    x("UPDATE users SET ads_off=? WHERE id=?", (0 if u["ads_off"] else 1, uid))
+    await show_settings(ctx, uid)
+
+
+async def show_rules(ctx, uid):
+    await say(ctx, uid,
+              "📖 <b>Botdan foydalanish</b>\n\n"
+              "• 🔍 Qidiruv: tasodifiy suhbatdosh topadi.\n"
+              "• /next: yangi suhbatdosh, /stop: suhbatni yakunlash.\n"
+              "• 💎 VIP: jins bo'yicha qidiruv, reklamasiz va kanalsiz foydalanish.\n"
+              "• 🔗 Link: suhbatdoshning lichkasi, yoshi, rasmi, viloyati va ismi.\n"
+              "• Obunalarni /vip va /link orqali hisobingizdan sotib olasiz.\n"
+              "• Hisobni «Hisob to'ldirish» orqali karta yoki Stars bilan to'ldirasiz.\n"
+              "• Chatda faqat matn; username, raqam, havola va reklama taqiqlangan.",
+              ikb([[("❓ Ko'p beriladigan savollar", "faq")]]))
+
+
+FAQ = {
+    "faq1": None,
+    "faq2": ("📝 <b>Qanday ro'yxatdan o'taman?</b>\n\n/start bosing, oferta qoidalariga rozilik bildiring. "
+             "So'ng ism, yosh (18+), jins va profil rasmini yuboring, Telegram joylashuvingizni ulashing "
+             "(viloyat shundan aniqlanadi). Shundan keyin menyular ochiladi."),
+    "faq3": ("💳 <b>Qanday hisobimni to'ldiraman?</b>\n\n«Hisob to'ldirish» ni bosing, Karta yoki Stars ni "
+             f"tanlang va summani kiriting (minimal {money(MIN_TOPUP)} so'm).\n\n"
+             "Karta: ko'rsatilgan kartaga aynan shu summani o'tkazing, «To'lov qildim» ni bosib chekni "
+             "yuboring. Admin tasdiqlagach hisobingiz to'ladi.\n\n"
+             "Stars: bot yuborgan to'lov oynasida to'lang, hisob darrov to'ladi."),
+}
+
+
+async def show_faq(ctx, uid):
+    await say(ctx, uid, "❓ <b>Ko'p beriladigan savollar</b>", ikb([
+        [("Qanday tekinga VIP va link olsam bo'ladi?", "faq1")],
+        [("Qanday ro'yxatdan o'taman?", "faq2")],
+        [("Qanday hisobimni to'ldiraman?", "faq3")]]))
+
+
+async def show_faq_answer(ctx, uid, key):
+    if key == "faq1":
+        return await show_free(ctx, uid)
+    await say(ctx, uid, FAQ[key], ikb([[("⬅️ Savollar", "faq")]]))
+
+
+# ---- Hisob to'ldirish ----
+async def u_topup(ctx, uid):
+    ctx.user_data["flow"] = {"k": "topup_method"}
+    await say(ctx, uid, "💳 <b>Hisobni to'ldirish</b>\n\nTo'lov usulini tanlang:",
+              RK([["💳 Karta", "⭐ Stars"], [M_CANCEL]]))
+
+
+async def ask_amount(ctx, uid, method):
+    ctx.user_data["flow"] = {"k": "topup_amt", "m": method}
+    await say(ctx, uid, f"💵 Summani kiriting (minimal {money(MIN_TOPUP)} so'm):", cancel_kb())
+
+
+async def show_card(ctx, uid, amt):
+    cards = q("SELECT * FROM cards")
+    if not cards:
+        return await say(ctx, uid, "❌ Hozircha karta qo'shilmagan. Keyinroq urinib ko'ring.", UM(uid))
+    t = ["💳 <b>To'lov uchun karta</b>\n"]
+    rows = []
+    for c in cards:
+        n = c["number"]
+        t.append(f"🏦 {esc(c['kind'])}\n<code>{' '.join(n[i:i + 4] for i in range(0, len(n), 4))}</code>\n"
+                 f"👤 {esc(c['owner'])}\n")
+        rows.append([(f"📋 {c['kind']} kartani nusxalash", "copy:" + n)])
+    t.append(f"⚠️ <b>Diqqat! Faqat ko'rsatilgan summani kiriting:</b> {money(amt)} so'm")
+    rows.append([("✅ To'lov qildim", f"paid:{amt}")])
+    await say(ctx, uid, "\n".join(t), ikb(rows))
+
+
+async def send_stars_invoice(ctx, uid, amt):
+    price = SI("star_price", 0)
+    if price <= 0:
+        return await say(ctx, uid, "❌ Stars narxi hali belgilanmagan.", UM(uid))
+    stars = max(1, math.ceil(amt / price))
+    await clear_last(ctx, uid)
+    m = await ctx.bot.send_invoice(chat_id=uid, title="Hisobni to'ldirish",
+                                   description=f"{money(amt)} so'm ({stars} Stars)",
+                                   payload=f"top:{uid}:{amt}", currency="XTR",
+                                   prices=[LabeledPrice(f"{money(amt)} so'm", stars)])
+    ctx.bot_data.setdefault("inv", {})[uid] = m.message_id
+    await say(ctx, uid, "⭐ Yuqoridagi xabardagi tugma orqali to'lang.\nBekor qilish uchun pastdagi tugmani bosing.",
+              cancel_kb())
+
+
+async def ask_receipt(ctx, uid, amt):
+    ctx.user_data["flow"] = {"k": "receipt", "amount": amt}
+    await say(ctx, uid, "📸 To'lov chekini shu yerga yuboring:", cancel_kb())
+
+
+def pay_caption(r):
+    u = U(r["user_id"])
+    return (f"💸 <b>To'lov #{r['id']}</b>\n\n👤 {user_link(u)}\n🆔 <code>{u['id']}</code>\n"
+            f"💵 Summa: <b>{money(r['amount'])}</b> so'm\n🕒 {fdate(r['created'])}")
+
+
+async def push_payment(ctx, pid):
+    r = q("SELECT * FROM payments WHERE id=?", (pid,), True)
+    kb = ikb([[("✅ Qabul qilish", f"po:{pid}:0"), ("❌ Rad etish", f"pn:{pid}:0")]])
+    for a in ADMIN_IDS:
+        try:
+            await ctx.bot.send_photo(a, r["file_id"], caption=pay_caption(r), reply_markup=kb, parse_mode=HTML)
+        except Exception as e:
+            logging.warning("payment push failed %s: %s", a, e)
+
+
+# ========================== SUHBAT (QIDIRUV) =========================
+class Shim:
+    """Fon vazifasi uchun ctx o'rnini bosadi (faqat bot va bot_data kerak)."""
+    def __init__(self, app):
+        self.bot, self.bot_data = app.bot, app.bot_data
+
+
+def pick_target():
+    """Admin sozlagan foizga qarab tasodifiy qidiruvda qaysi jins tushishini tanlaydi."""
+    b, g = SI("boy_pct", 50), SI("girl_pct", 50)
+    if b > g:
+        return "yigit"
+    if g > b:
+        return "qiz"
+    n = SI("srch_n", 0) + 1
+    setS("srch_n", n)
+    return "qiz" if n % 25 == 0 else "yigit"
+
+
+async def send_partner_info(ctx, to, p):
+    cap = ("👤 <b>Muloqotchi ma'lumotlari</b>\n\n"
+           f"📛 Ism: {esc(p['name'])}\n🎂 Yosh: {p['age']}\n🌍 Viloyat: {esc(p['region'])}\n"
+           f"⚧ Jins: {GENDER.get(p['gender'], '-')}\n🔗 Lichka: {user_link(p)}")
+    if p["gender"] == "qiz":
+        cap += ("\n\n⚠️ Agar muloqotchining lichkasiga haqoratli xabar yozsangiz yoki pedofiliya va boshqa "
+                "qonunbuzarlik qilsangiz, tegishli choralar ko'rishga majbur bo'lamiz.")
+    try:
+        if p["photo"]:
+            await ctx.bot.send_photo(to, p["photo"], caption=cap, parse_mode=HTML)
+        else:
+            await ctx.bot.send_message(to, cap, parse_mode=HTML)
+    except Exception as e:
+        logging.warning("partner info failed: %s", e)
+
+
+async def pair(ctx, a, b):
+    pairs = ctx.bot_data["pairs"]
+    pairs[a], pairs[b] = b, a
+    dead = None
+    for me, other in ((a, b), (b, a)):
+        x("UPDATE users SET chat_count=chat_count+1 WHERE id=?", (me,))
+        await clear_last(ctx, me)
+        try:
+            await ctx.bot.send_message(me, "✅ <b>Muloqotchi topildi!</b>\n\nYozishingiz mumkin.\n"
+                                           "Suhbatni yakunlash: /stop", reply_markup=stop_kb(), parse_mode=HTML)
+        except Exception:
+            dead = me
+            continue
+        if link_on(U(me)):
+            await send_partner_info(ctx, me, U(other))
+    if dead:
+        await end_chat(ctx, dead, notify_self=False)
+
+
+async def do_search(ctx, uid, target=None):
+    u = U(uid)
+    bd = ctx.bot_data
+    async with bd["lock"]:
+        if uid in bd["pairs"]:
+            return
+        bd["wait"][:] = [w for w in bd["wait"] if w["uid"] != uid]
+        explicit = target is not None
+        t = target or pick_target()
+        match = None
+        for w in bd["wait"]:
+            if w["gender"] != t:
+                continue
+            if w["target"] and w["target"] != u["gender"]:
+                continue
+            match = w
+            break
+        if match:
+            bd["wait"].remove(match)
+            await pair(ctx, uid, match["uid"])
+            return
+        bd["wait"].append({"uid": uid, "gender": u["gender"], "target": t if explicit else None,
+                           "since": time.time()})
+    await say(ctx, uid, "🔎 <b>Muloqotchi qidirilmoqda...</b>\n\nBekor qilish: /stop", UM(uid))
+
+
+async def matcher(app):
+    """Uzoq kutgan tasodifiy qidiruvchilarni (25 soniyadan keyin) bir-biriga ulaydi."""
+    shim = Shim(app)
+    while True:
+        await asyncio.sleep(5)
+        try:
+            async with app.bot_data["lock"]:
+                wait = app.bot_data["wait"]
+                old = [w for w in wait if w["target"] is None and time.time() - w["since"] > 25]
+                while len(old) >= 2:
+                    a, b = old.pop(0), old.pop(0)
+                    wait.remove(a)
+                    wait.remove(b)
+                    await pair(shim, a["uid"], b["uid"])
+        except Exception as e:
+            logging.warning("matcher error: %s", e)
+
+
+async def u_search(ctx, uid, target=None):
+    u = U(uid)
+    if not u["registered"]:
+        return await need_reg(ctx, uid)
+    if uid in ctx.bot_data["pairs"]:
+        return
+    if not await gate(ctx, uid):
+        return
+    await do_search(ctx, uid, target)
+
+
+async def u_gender(ctx, uid, g):
+    u = U(uid)
+    if not u["registered"]:
+        return await need_reg(ctx, uid)
+    if not vip_on(u):
+        return await say(ctx, uid, "💎 Jins bo'yicha qidiruv faqat <b>VIP</b> obunali foydalanuvchilar uchun.",
+                         ikb([[("💎 VIP sotib olish", "buy:vip")], [("🎁 Tekinga olish", "free")]]))
+    await u_search(ctx, uid, g)
+
+
+async def end_chat(ctx, uid, notify_self=True):
+    pairs = ctx.bot_data["pairs"]
+    partner = pairs.pop(uid, None)
+    if partner is None:
+        return
+    pairs.pop(partner, None)
+    x("UPDATE users SET last_partner=? WHERE id=?", (partner, uid))
+    x("UPDATE users SET last_partner=? WHERE id=?", (uid, partner))
+    sides = [(partner, "🔚 Muloqotchi suhbatni yakunladi.\n\n/next - yangi muloqotchi topish")]
+    if notify_self:
+        sides.append((uid, "🔚 Suhbat yakunlandi.\n\n/next - yangi muloqotchi topish"))
+    for who, text in sides:
+        await say(ctx, who, text, UM(who))
+        await say(ctx, who, "Bu foydalanuvchi o'zini yomon tutdimi?",
+                  ikb([[("🚨 Shikoyat qilish", "cmp")], [("🔄 Yangi suhbatdosh", "nxt")]]), slot=1)
+
+
+async def cancel_search(ctx, uid):
+    wait = ctx.bot_data["wait"]
+    if any(w["uid"] == uid for w in wait):
+        wait[:] = [w for w in wait if w["uid"] != uid]
+        return True
+    return False
+
+
+async def relay(update, ctx):
+    """Suhbat paytida xabarlarni suhbatdoshga yetkazadi (faqat matn)."""
+    m = update.message
+    uid = update.effective_user.id
+    partner = ctx.bot_data["pairs"].get(uid)
+    if canon(m.text or "") == M_STOP:
+        await eat(update)
+        return await end_chat(ctx, uid)
+    if not m.text:
+        return await m.reply_text("⚠️ Faqat matn orqali suhbatlasha olasiz.")
+    if forbidden(m.text):
+        return await m.reply_text("⚠️ Xabaringiz yuborilmadi: username, telefon raqam, havola, guruh/kanal "
+                                  "linki va reklama yuborish taqiqlangan.")
+    try:
+        await ctx.bot.send_message(partner, m.text)
+    except Exception:
+        await end_chat(ctx, uid)
+
+
+# ============================ SHIKOYAT, BAN ==========================
+async def start_complaint(ctx, uid):
+    rep = U(uid)["last_partner"]
+    if not rep:
+        return await say(ctx, uid, "❌ Shikoyat qilinadigan foydalanuvchi topilmadi.", UM(uid))
+    if q("SELECT 1 FROM complaints WHERE complainant=? AND reported=?", (uid, rep), True):
+        return await say(ctx, uid, "ℹ️ Siz bu foydalanuvchi ustidan allaqachon shikoyat yuborgansiz.", UM(uid))
+    ctx.user_data["flow"] = {"k": "complaint", "rep": rep}
+    await say(ctx, uid, "Botimiz sizga noqulaylik tug'dirganidan hijolatdamiz. Iltimos, vaziyatni "
+                        "ochiqroq tushuntirib bering: ushbu muloqotchi nima deganini yozing yoki bo'lgan "
+                        "suhbatni screenshot qilib yuboring. Biz bu muloqotchini tekshirib, sizga javobini "
+                        "e'lon qilamiz.", cancel_kb())
+
+
+async def ban_user(ctx, uid):
+    x("UPDATE users SET banned=1 WHERE id=?", (uid,))
+    await cancel_search(ctx, uid)
+    if uid in ctx.bot_data["pairs"]:
+        await end_chat(ctx, uid, notify_self=False)
+    try:
+        await ctx.bot.send_message(uid, block_text(), parse_mode=HTML, reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
+
+
+async def unban_user(ctx, uid):
+    x("UPDATE users SET banned=0 WHERE id=?", (uid,))
+    try:
+        await ctx.bot.send_message(uid, "✅ Blokingiz olib tashlandi. /start bosing.")
+    except Exception:
+        pass
+
+
+# ============================== ADMIN PANEL ==========================
+ADMIN_MAIN = [("📊 Statistika", "stat"), ("📢 Majburiy obuna", "sub"), ("💎 Obuna narxi", "price"),
+              ("⭐ Stars narxi", "stars"), ("💳 Karta qo'shish", "card"), ("💸 To'lovlar", "pay"),
+              ("🚨 Shikoyatlar", "comp"), ("🚫 Ban / Unban", "ban"), ("➕ Hisobga pul tashlash", "addm"),
+              ("🎟 Promo kod qo'shish", "promo"), ("📨 Broadcast / Reklama", "bc"),
+              ("👤 Username qo'shish", "uname"), ("🔎 Qidiruvni boshqarish", "srch"),
+              ("🎨 Bot dizayni", "design"), ("🏆 Reyting sovrini", "prize"), ("✨ Premium emoji", "emoji"),
+              ("👤 User menu", "exit")]
+SUB_MENU = [("➕ Kanal qo'shish", "ch_add"), ("📋 Mavjud kanallar", "ch_list"),
+            ("🗑 Kanal o'chirish", "ch_del"), ("📣 Kanalga reklama", "ch_ad")]
+CARD_MENU = [("➕ Yangi karta", "cd_add"), ("📋 Mavjud kartalar", "cd_list"), ("🗑 Karta o'chirish", "cd_del")]
+BC_MENU = [("📨 Hammaga xabar", "bc_all"), ("📣 Reklama yuborish", "bc_ads")]
+BAN_MENU = [("🚫 Ban qilish", "do_ban"), ("✅ Unban qilish", "do_unban")]
+PRICE_MENU = [("💎 VIP narxi", "pr_vip"), ("🔗 Link narxi", "pr_link")]
+DESIGN_MENU = [("🎞 Classic", "ds_classic"), ("✨ Zamonaviy", "ds_modern")]
+ALL_ADMIN = {}
+for _items in (ADMIN_MAIN, SUB_MENU, CARD_MENU, BC_MENU, BAN_MENU, PRICE_MENU, DESIGN_MENU,
+               [("⬅️ Admin panel", "home")]):
+    for _lab, _key in _items:
+        ALL_ADMIN[_lab] = _key
+
+
+def is_modern():
+    return S("design", "classic") == "modern"
+
+
+def amenu(items, back=True):
+    """Classic: pastki reply tugmalar. Zamonaviy: chatdagi inline tugmalar."""
+    items = list(items) + ([("⬅️ Admin panel", "home")] if back else [])
+    rows = [items[i:i + 2] for i in range(0, len(items), 2)]
+    if is_modern():
+        return ikb([[(l, "a:" + k) for l, k in r] for r in rows])
+    return RK([[l for l, k in r] for r in rows])
+
+
+def back_kb():
+    if is_modern():
+        return ikb([[("⬅️ Admin panel", "a:home")]])
+    return RK([["⬅️ Admin panel"]])
+
+
+def akb(ctx, uid, rows):
+    """Zamonaviy: inline tugmalar. Classic: pastki reply tugmalar (bosilganda mos amal bajariladi)."""
+    if is_modern():
+        return ikb(rows)
+    mp, out, seen = {}, [], set()
+    for r in rows:
+        line = []
+        for t, d in r:
+            lab, n = t, 2
+            while lab in seen:
+                lab, n = f"{t} ({n})", n + 1
+            seen.add(lab)
+            mp[lab] = d
+            line.append(lab)
+        out.append(line)
+    ctx.bot_data.setdefault("rk", {})[uid] = mp
+    return RK(out)
+
+
+PK_ROWS = [[("💵 Summa", "pk:amount"), ("💎 VIP", "pk:vip"), ("🔗 Link", "pk:link")],
+           [("⬅️ Admin panel", "a:home")]]
+
+
+async def ask(ctx, uid, k, prompt, **extra):
+    ctx.bot_data.get("rk", {}).pop(uid, None)
+    ctx.user_data["flow"] = {"k": k, "p": prompt, **extra}
+    await say(ctx, uid, prompt, back_kb())
+
+
+async def a_home(ctx, uid):
+    await say(ctx, uid, "🛠 <b>Admin panel</b>", amenu(ADMIN_MAIN, back=False))
+
+
+async def a_exit(ctx, uid):
+    await main_menu(ctx, uid)
+
+
+async def a_stat(ctx, uid):
+    n = q("SELECT COUNT(*) c FROM users", one=True)["c"]
+    s = q("SELECT COALESCE(SUM(deposited), 0) s FROM users", one=True)["s"]
+    await say(ctx, uid, f"📊 <b>Statistika</b>\n\n👥 Jami userlar: <b>{n}</b>\n"
+                        f"💰 Userlar kiritgan jami summa: <b>{money(s)}</b> so'm", amenu(ADMIN_MAIN, False))
+
+
+async def a_sub(ctx, uid):
+    await say(ctx, uid, "📢 <b>Majburiy obuna</b>", amenu(SUB_MENU))
+
+
+async def a_price(ctx, uid):
+    def line(k, n):
+        p, d = SI(k + "_price"), SI(k + "_days")
+        return f"{n}: {money(p)} so'm / {d} kun" if p and d else f"{n}: belgilanmagan"
+    await say(ctx, uid, f"💎 <b>Obuna narxi</b>\n\n{line('vip', 'VIP')}\n{line('link', 'Link')}", amenu(PRICE_MENU))
+
+
+async def a_stars(ctx, uid):
+    await ask(ctx, uid, "a_stars", "⭐ 1 ta Stars necha so'm? (masalan: 120)")
+
+
+async def a_card(ctx, uid):
+    await say(ctx, uid, "💳 <b>Karta qo'shish</b>", amenu(CARD_MENU))
+
+
+async def a_ban(ctx, uid):
+    await say(ctx, uid, "🚫 <b>Ban / Unban</b>", amenu(BAN_MENU))
+
+
+async def a_bc(ctx, uid):
+    await say(ctx, uid, "📨 <b>Broadcast / Reklama</b>", amenu(BC_MENU))
+
+
+async def a_design(ctx, uid):
+    cur = "Zamonaviy" if is_modern() else "Classic"
+    await say(ctx, uid, f"🎨 <b>Bot dizayni</b> (faqat sizning admin ko'rinishingiz)\n\nHozirgi: <b>{cur}</b>\n\n"
+                        "Classic: pastki reply tugmalar\nZamonaviy: chatdagi inline tugmalar", amenu(DESIGN_MENU))
+
+
+async def a_addm(ctx, uid):
+    await ask(ctx, uid, "a_addm_id", "🆔 Foydalanuvchi ID sini yuboring:")
+
+
+async def a_promo(ctx, uid):
+    await ask(ctx, uid, "a_p_code", "🎟 Promo kodni yozing (masalan: YANGI50):")
+
+
+def emoji_targets():
+    t = [l for r in USER_ROWS for l in r] + [M_ADMIN, M_STOP, M_CANCEL, "💳 Karta", "⭐ Stars",
+                                              "📍 Joylashuvni yuborish"]
+    t += [l for l, k in ADMIN_MAIN] + ["⬅️ Admin panel"]
+    return list(dict.fromkeys(t))
+
+
+async def a_emoji(ctx, uid):
+    em = emap()
+    rows, line = [], []
+    for i, l in enumerate(emoji_targets()):
+        line.append((("✅ " if l in em else "") + l, f"em:{i}"))
+        if len(line) == 2:
+            rows.append(line)
+            line = []
+    if line:
+        rows.append(line)
+    rows.append([("🧹 Hammasini tozalash", "em:clear")])
+    rows.append([("⬅️ Admin panel", "a:home")])
+    await say(ctx, uid, "✨ <b>Premium emoji</b>\n\nQaysi tugma uchun emoji qo'yamiz? Tugmani tanlang, so'ng "
+                        "premium emojini yuboring. ✅ = emoji qo'yilgan.", ikb(rows))
+
+
+async def a_prize(ctx, uid):
+    await ask(ctx, uid, "a_prize1", "🥇 1-o'rin uchun necha kun VIP + link beramiz? (0 = berilmaydi)")
+
+
+async def a_uname(ctx, uid):
+    await ask(ctx, uid, "a_uname", "👤 O'z Telegram username'ingizni yuboring (masalan: @admin):")
+
+
+async def a_srch(ctx, uid):
+    await say(ctx, uid, "🔎 <b>Qidiruvni boshqarish</b>\n\n"
+                        f"👦 Yigit bola: <b>{SI('boy_pct', 50)}%</b>\n👧 Qiz bola: <b>{SI('girl_pct', 50)}%</b>\n\n"
+                        "Foizi katta jins qidiruvda tushadi. Teng bo'lsa: yigitlar, har 25-qidiruvda bitta qiz.",
+              akb(ctx, uid, [[("👦 Yigit bola", "sc:yigit"), ("👧 Qiz bola", "sc:qiz")],
+                             [("⬅️ Admin panel", "a:home")]]))
+
+
+def pct_text(g, v):
+    return f"🔎 {GENDER[g]} bola foizi: <b>{v}%</b>"
+
+
+def pct_kb(ctx, uid, g, v):
+    return akb(ctx, uid, [[("➖", f"sm:{g}"), (f"{v}%", "noop"), ("➕", f"sp:{g}")],
+                          [("✅ Tayyor", f"sd:{g}")]])
+
+
+async def ch_add(ctx, uid):
+    await ask(ctx, uid, "a_ch_add", "📢 Kanal username'ini (@kanal) yoki ID sini yuboring.\n"
+                                    "Bot kanalda admin bo'lishi kerak.")
+
+
+async def ch_list(ctx, uid):
+    rows = q("SELECT * FROM channels")
+    t = "\n".join(f"{i}. {esc(c['title'])} — {esc(c['link'])}" for i, c in enumerate(rows, 1))
+    await say(ctx, uid, "📋 <b>Majburiy kanallar</b>\n\n" + (t or "Hozircha kanal yo'q."), amenu(SUB_MENU))
+
+
+async def ch_pick(ctx, uid, prefix, title):
+    rows = q("SELECT * FROM channels")
+    if not rows:
+        return await say(ctx, uid, "Hozircha kanal yo'q.", amenu(SUB_MENU))
+    await say(ctx, uid, title, akb(ctx, uid, [[(c["title"], f"{prefix}:{c['id']}")] for c in rows]
+                                    + [[("⬅️ Admin panel", "a:home")]]))
+
+
+async def ch_del(ctx, uid):
+    await ch_pick(ctx, uid, "xd", "🗑 O'chiriladigan kanalni tanlang:")
+
+
+async def ch_ad(ctx, uid):
+    await ch_pick(ctx, uid, "xa", "📣 Qaysi kanalga reklama yuboramiz?")
+
+
+async def cd_add(ctx, uid):
+    await say(ctx, uid, "💳 Karta turini tanlang:",
+              akb(ctx, uid, [[("Uzcard", "ct:Uzcard"), ("Humo", "ct:Humo"), ("Visa", "ct:Visa")],
+                             [("⬅️ Admin panel", "a:home")]]))
+
+
+async def cd_list(ctx, uid):
+    rows = q("SELECT * FROM cards")
+    t = "\n".join(f"{i}. {esc(c['kind'])} — {esc(c['owner'])} — <code>{c['number']}</code>"
+                  for i, c in enumerate(rows, 1))
+    await say(ctx, uid, "📋 <b>Kartalar</b>\n\n" + (t or "Hozircha karta yo'q."), amenu(CARD_MENU))
+
+
+async def cd_del(ctx, uid):
+    rows = q("SELECT * FROM cards")
+    if not rows:
+        return await say(ctx, uid, "Hozircha karta yo'q.", amenu(CARD_MENU))
+    await say(ctx, uid, "🗑 O'chiriladigan kartani tanlang:",
+              akb(ctx, uid, [[(f"{c['kind']} ••••{c['number'][-4:]}", f"kd:{c['id']}")] for c in rows]
+                  + [[("⬅️ Admin panel", "a:home")]]))
+
+
+async def pr_vip(ctx, uid):
+    await ask(ctx, uid, "a_pr_price", "💎 VIP narxi necha so'm?", kind="vip")
+
+
+async def pr_link(ctx, uid):
+    await ask(ctx, uid, "a_pr_price", "🔗 Link obuna narxi necha so'm?", kind="link")
+
+
+async def bc_all(ctx, uid):
+    await ask(ctx, uid, "a_bc", "📨 Hammaga yuboriladigan xabarni yuboring (matn, rasm, audio, fayl...):", ads=False)
+
+
+async def bc_ads(ctx, uid):
+    await ask(ctx, uid, "a_bc", "📣 Reklama xabarini yuboring (reklamani o'chirgan VIP/link userlarga bormaydi):", ads=True)
+
+
+async def do_ban(ctx, uid):
+    await ask(ctx, uid, "a_ban", "🚫 Ban qilinadigan foydalanuvchi ID sini yuboring:", do="ban")
+
+
+async def do_unban(ctx, uid):
+    await ask(ctx, uid, "a_ban", "✅ Unban qilinadigan foydalanuvchi ID sini yuboring:", do="unban")
+
+
+async def ds_classic(ctx, uid):
+    setS("design", "classic")
+    await say(ctx, uid, "✅ Classic rejim yoqildi.", amenu(ADMIN_MAIN, False))
+
+
+async def ds_modern(ctx, uid):
+    setS("design", "modern")
+    await say(ctx, uid, "✅ Zamonaviy rejim yoqildi.", amenu(ADMIN_MAIN, False))
+
+
+# ---- Shikoyatlar ----
+async def a_comp(ctx, uid, idx=0):
+    rows = q("SELECT * FROM complaints WHERE status='new' ORDER BY id")
+    if not rows:
+        return await say(ctx, uid, "✅ Yangi shikoyatlar yo'q.", amenu(ADMIN_MAIN, False))
+    idx = max(0, min(idx, len(rows) - 1))
+    c = rows[idx]
+    cu = U(c["complainant"])
+    txt = (f"🚨 <b>Shikoyat {idx + 1}/{len(rows)}</b>\n\n{esc(c['text'] or '(matnsiz)')}\n\n"
+           f"👤 Shikoyatchi ID: <code>{c['complainant']}</code>\n🔗 Lichka: {user_link(cu)}\n"
+           f"⚠️ Shikoyat qilingan ID: <code>{c['reported']}</code>")
+    kb = akb(ctx, uid, [[("⬅️ Oldingisi", f"cp:{idx - 1}"), ("Keyingisi ➡️", f"cp:{idx + 1}")],
+                        [("✅ Ko'rib chiqildi", f"cv:{c['id']}:{idx}"), ("❌ Rad etildi", f"cr:{c['id']}:{idx}")],
+                        [("🚫 Shikoyat qilinganni ban qilish", f"cb:{c['reported']}:{idx}")],
+                        [("⬅️ Admin panel", "a:home")]])
+    await say(ctx, uid, txt, kb, photo=c["file_id"])
+
+
+async def comp_decide(ctx, uid, cid, idx, ok):
+    c = q("SELECT * FROM complaints WHERE id=?", (cid,), True)
+    if c and c["status"] == "new":
+        x("UPDATE complaints SET status=? WHERE id=?", ("done" if ok else "rejected", cid))
+        msg = ("✅ Arizangiz ko'rib chiqildi, tez orada admin sizga shaxsiy xabardan yozadi." if ok else
+               "ℹ️ Ushbu muloqotchi allaqachon chiqib ketgan ekan, arizangiz ko'rib chiqildi.")
+        try:
+            await ctx.bot.send_message(c["complainant"], msg)
+        except Exception:
+            pass
+    await a_comp(ctx, uid, idx)
+
+
+# ---- To'lovlar ----
+async def a_pay(ctx, uid):
+    r = q("SELECT * FROM payments WHERE status='new' ORDER BY id LIMIT 1", one=True)
+    if not r:
+        return await say(ctx, uid, "✅ Yangi to'lovlar yo'q.", amenu(ADMIN_MAIN, False))
+    kb = akb(ctx, uid, [[("✅ Qabul qilish", f"po:{r['id']}:1"), ("❌ Rad etish", f"pn:{r['id']}:1")],
+                        [("⬅️ Admin panel", "a:home")]])
+    await say(ctx, uid, pay_caption(r), kb, photo=r["file_id"])
+
+
+async def pay_decide(ctx, uid, pid, ok, pager):
+    r = q("SELECT * FROM payments WHERE id=?", (pid,), True)
+    if not r or r["status"] != "new":
+        note = "ℹ️ Bu to'lov allaqachon ko'rib chiqilgan."
+    elif ok:
+        x("UPDATE payments SET status='ok' WHERE id=?", (pid,))
+        x("UPDATE users SET balance=balance+?, deposited=deposited+? WHERE id=?",
+          (r["amount"], r["amount"], r["user_id"]))
+        note = f"✅ #{pid} qabul qilindi: {money(r['amount'])} so'm."
+        try:
+            await ctx.bot.send_message(r["user_id"], f"✅ To'lovingiz tasdiqlandi. Hisobingizga "
+                                                     f"{money(r['amount'])} so'm qo'shildi.")
+        except Exception:
+            pass
+    else:
+        x("UPDATE payments SET status='no' WHERE id=?", (pid,))
+        note = f"❌ #{pid} rad etildi."
+        try:
+            await ctx.bot.send_message(r["user_id"], "❌ To'lovingiz rad etildi. Savollar bo'lsa adminga murojaat qiling.")
+        except Exception:
+            pass
+    if pager:
+        await a_pay(ctx, uid)
+    else:
+        await ctx.bot.send_message(uid, note)
+
+
+async def run_broadcast(ctx, admin, chat_id, msg_id, ads):
+    t = time.time()
+    sql = "SELECT id FROM users WHERE banned=0 AND registered=1"
+    if ads:
+        sql += " AND NOT (ads_off=1 AND (vip_until>? OR link_until>?))"
+    rows = q(sql, (t, t) if ads else ())
+    ok = bad = 0
+    for r in rows:
+        try:
+            await ctx.bot.copy_message(r["id"], chat_id, msg_id)
+            ok += 1
+        except Exception:
+            bad += 1
+        await asyncio.sleep(0.05)
+    await ctx.bot.send_message(admin, f"✅ Yuborish tugadi.\n📬 Yetkazildi: {ok}\n❌ Xato: {bad}")
+
+
+ADM = {"home": a_home, "exit": a_exit, "stat": a_stat, "sub": a_sub, "price": a_price, "stars": a_stars,
+       "card": a_card, "pay": a_pay, "comp": a_comp, "ban": a_ban, "addm": a_addm, "promo": a_promo,
+       "bc": a_bc, "prize": a_prize, "emoji": a_emoji, "uname": a_uname, "srch": a_srch, "design": a_design, "ch_add": ch_add,
+       "ch_list": ch_list, "ch_del": ch_del, "ch_ad": ch_ad, "cd_add": cd_add, "cd_list": cd_list,
+       "cd_del": cd_del, "pr_vip": pr_vip, "pr_link": pr_link, "bc_all": bc_all, "bc_ads": bc_ads,
+       "do_ban": do_ban, "do_unban": do_unban, "ds_classic": ds_classic, "ds_modern": ds_modern}
+
+
+async def adm(ctx, uid, key):
+    """Har qanday admin menyusi bosilganda eski kutilayotgan holat tozalanadi (kanal xatosi shundan)."""
+    ctx.user_data.pop("flow", None)
+    ctx.bot_data.get("rk", {}).pop(uid, None)
+    fn = ADM.get(key)
+    if fn:
+        await fn(ctx, uid)
+
+
+# ====================== ADMIN: MATN KUTISH HOLATLARI =================
+async def admin_flow(update, ctx, fl):
+    m = update.message
+    uid = update.effective_user.id
+    k = fl["k"]
+    text = (m.text or "").strip()
+    if k not in ("a_chad", "a_bc"):
+        await eat(update)
+
+    async def err(t):
+        await say(ctx, uid, t + "\n\n" + fl["p"], back_kb())
+
+    async def done(t):
+        ctx.user_data.pop("flow", None)
+        await say(ctx, uid, t, amenu(ADMIN_MAIN, back=False))
+
+    async def nxt(newk, prompt, **kw):
+        fl.update(kw)
+        fl["k"], fl["p"] = newk, prompt
+        await say(ctx, uid, prompt, back_kb())
+
+    if k == "a_ch_add":
+        ref = text
+        if ref.startswith("https://t.me/"):
+            ref = "@" + ref.rstrip("/").split("/")[-1]
+        elif re.fullmatch(r"[A-Za-z]\w{3,}", ref):
+            ref = "@" + ref
+        elif re.fullmatch(r"-?\d+", ref):
+            ref = int(ref)
+        try:
+            chat = await ctx.bot.get_chat(ref)
+        except Exception:
+            return await err("❌ Kanal topilmadi: username noto'g'ri yoki bot kanalda yo'q. "
+                             "To'g'ri @username yuboring yoki boshqa menyuni tanlang.")
+        try:
+            me = await ctx.bot.get_chat_member(chat.id, ctx.bot.id)
+            ok = me.status in ("administrator", "creator")
+        except Exception:
+            ok = False
+        if not ok:
+            return await err("❌ Bot bu kanalda admin emas. Avval botni kanalga admin qiling.")
+        link = f"https://t.me/{chat.username}" if chat.username else None
+        if not link:
+            try:
+                link = chat.invite_link or await ctx.bot.export_chat_invite_link(chat.id)
+            except Exception:
+                return await err("❌ Kanal havolasini olib bo'lmadi. Botga 'havola yaratish' huquqini bering.")
+        x("DELETE FROM channels WHERE chat_id=?", (chat.id,))
+        x("INSERT INTO channels(chat_id, title, link) VALUES(?, ?, ?)", (chat.id, chat.title or str(chat.id), link))
+        return await done(f"✅ Kanal qo'shildi: {esc(chat.title)}")
+    if k == "a_chad":
+        try:
+            await ctx.bot.copy_message(fl["chat"], m.chat_id, m.message_id)
+        except Exception:
+            await eat(update)
+            return await err("❌ Yuborib bo'lmadi. Bot kanalda admin ekanini tekshiring.")
+        await eat(update)
+        return await done("✅ Reklama kanalga yuborildi.")
+    if k == "a_bc":
+        ctx.user_data.pop("flow", None)
+        task = asyncio.create_task(run_broadcast(ctx, uid, m.chat_id, m.message_id, fl["ads"]))
+        tasks = ctx.bot_data.setdefault("tasks", set())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return await say(ctx, uid, "📨 Yuborish boshlandi. Tugagach xabar beraman.", amenu(ADMIN_MAIN, False))
+    if k == "a_card_owner":
+        if not text:
+            return await err("❌ Ismni yozing.")
+        return await nxt("a_card_num", "💳 16 xonali karta raqamini yozing:", owner=text)
+    if k == "a_card_num":
+        n = re.sub(r"\D", "", text)
+        if len(n) != 16:
+            return await err("❌ Karta raqami aniq 16 ta raqam bo'lishi kerak.")
+        x("INSERT INTO cards(kind, owner, number) VALUES(?, ?, ?)", (fl["kind"], fl["owner"], n))
+        return await done("✅ Karta qo'shildi.")
+    if k == "a_pr_price":
+        n = num(text)
+        if not n:
+            return await err("❌ Narxni raqam bilan yozing.")
+        return await nxt("a_pr_days", "⏳ Obuna necha kunga beriladi?", price=n)
+    if k == "a_pr_days":
+        n = num(text)
+        if not n:
+            return await err("❌ Kunni raqam bilan yozing.")
+        setS(fl["kind"] + "_price", fl["price"])
+        setS(fl["kind"] + "_days", n)
+        return await done(f"✅ Saqlandi: {money(fl['price'])} so'm / {n} kun.")
+    if k == "a_stars":
+        n = num(text)
+        if not n:
+            return await err("❌ Raqam yozing.")
+        setS("star_price", n)
+        return await done(f"✅ 1 Stars = {money(n)} so'm qilib saqlandi.")
+    if k == "a_ban":
+        n = num(text)
+        if not n or not U(n):
+            return await err("❌ Bunday foydalanuvchi topilmadi.")
+        if fl["do"] == "ban":
+            await ban_user(ctx, n)
+            return await done(f"🚫 {n} bloklandi.")
+        await unban_user(ctx, n)
+        return await done(f"✅ {n} blokdan chiqarildi.")
+    if k == "a_addm_id":
+        n = num(text)
+        if not n or not U(n):
+            return await err("❌ Bunday foydalanuvchi topilmadi.")
+        return await nxt("a_addm_amt", "💵 Necha so'm tashlaymiz?", target=n)
+    if k == "a_addm_amt":
+        n = num(text)
+        if not n:
+            return await err("❌ Summani raqam bilan yozing.")
+        x("UPDATE users SET balance=balance+? WHERE id=?", (n, fl["target"]))
+        try:
+            await ctx.bot.send_message(fl["target"], f"💰 Hisobingizga {money(n)} so'm qo'shildi.")
+        except Exception:
+            pass
+        return await done(f"✅ {fl['target']} hisobiga {money(n)} so'm tashlandi.")
+    if k == "a_p_code":
+        code = text.upper()
+        if not re.fullmatch(r"[A-Z0-9_\-]{3,20}", code):
+            return await err("❌ Kod 3-20 ta harf/raqamdan iborat bo'lsin.")
+        return await nxt("a_p_uses", "🔢 Necha marta ishlatish mumkin?", code=code)
+    if k == "a_p_uses":
+        n = num(text)
+        if not n:
+            return await err("❌ Raqam yozing.")
+        fl["uses"], fl["k"] = n, "a_p_kind"
+        return await say(ctx, uid, "🎁 Promo kod nima beradi?", akb(ctx, uid, PK_ROWS))
+    if k == "a_p_kind":
+        return await say(ctx, uid, "🎁 Promo kod nima beradi?", akb(ctx, uid, PK_ROWS))
+    if k == "a_p_val":
+        n = num(text)
+        if not n:
+            return await err("❌ Raqam yozing.")
+        return await nxt("a_p_valid", "📅 Promo kod necha kun amal qiladi?", value=n)
+    if k == "a_p_valid":
+        n = num(text)
+        if not n:
+            return await err("❌ Kunni raqam bilan yozing.")
+        x("INSERT OR REPLACE INTO promos(code, uses_left, expires, kind, value) VALUES(?, ?, ?, ?, ?)",
+          (fl["code"], fl["uses"], time.time() + n * 86400, fl["kind"], fl["value"]))
+        return await done(f"✅ Promo kod qo'shildi: <code>{fl['code']}</code>")
+    if k == "a_emoji_set":
+        em = emap()
+        old = dict(em)
+        if text == "0":
+            em.pop(fl["label"], None)
+        else:
+            ids = [e.custom_emoji_id for e in (m.entities or []) if e.type == "custom_emoji"]
+            if not ids:
+                return await err("❌ Premium emoji topilmadi. Xabarda premium emoji bo'lishi kerak.")
+            em[fl["label"]] = ids[0]
+        setS("emoji_map", json.dumps(em))
+        try:  # Telegram qabul qilishini tekshiramiz
+            await ctx.bot.send_message(uid, "✨ Tekshiruv: tugma shunday ko'rinadi 👇",
+                                       reply_markup=RK([[fl["label"]]]))
+        except Exception:
+            setS("emoji_map", json.dumps(old))
+            return await err("❌ Telegram bu emojini qabul qilmadi (bot egasida Premium yo'q yoki emoji noto'g'ri).")
+        if is_modern():
+            await ctx.bot.send_message(uid, "🏠", reply_markup=UM(uid))
+        return await done("✅ Saqlandi. Userlarda yangi tugmalar keyingi menyu xabarida ko'rinadi.")
+    if k in ("a_prize1", "a_prize2", "a_prize3"):
+        n = num(text)
+        if n is None:
+            return await err("❌ Raqam yozing (0 = berilmaydi).")
+        i = int(k[-1])
+        fl[f"p{i}"] = n
+        if i < 3:
+            return await nxt(f"a_prize{i + 1}", f"{['🥇', '🥈', '🥉'][i]} {i + 1}-o'rin uchun necha kun "
+                                                 "VIP + link beramiz? (0 = berilmaydi)")
+        setS("prize_1", fl["p1"])
+        setS("prize_2", fl["p2"])
+        setS("prize_3", n)
+        return await done("✅ Haftalik sovrinlar saqlandi.")
+    if k == "a_uname":
+        if not re.fullmatch(r"@?[A-Za-z]\w{4,31}", text):
+            return await err("❌ Username noto'g'ri. Masalan: @admin")
+        setS("admin_username", text.lstrip("@"))
+        return await done(f"✅ Admin username saqlandi: @{esc(text.lstrip('@'))}")
+
+
+async def admin_cb(ctx, uid, d, qy):
+    if d == "noop":
+        return
+    if d.startswith("a:"):
+        return await adm(ctx, uid, d[2:])
+    if d.startswith("em:"):
+        arg = d[3:]
+        if arg == "clear":
+            setS("emoji_map", "{}")
+            return await a_emoji(ctx, uid)
+        label = emoji_targets()[int(arg)]
+        return await ask(ctx, uid, "a_emoji_set",
+                         f"✨ «{esc(label)}» tugmasi uchun premium emojini yuboring (bitta emoji).\n"
+                         "Olib tashlash uchun 0 yozing.", label=label)
+    if d.startswith("xd:"):
+        x("DELETE FROM channels WHERE id=?", (int(d[3:]),))
+        return await say(ctx, uid, "🗑 Kanal o'chirildi.", amenu(SUB_MENU))
+    if d.startswith("xa:"):
+        c = q("SELECT * FROM channels WHERE id=?", (int(d[3:]),), True)
+        if c:
+            await ask(ctx, uid, "a_chad", f"📣 «{esc(c['title'])}» kanaliga yuboriladigan reklamani yuboring "
+                                         "(matn, rasm, audio, fayl...):", chat=c["chat_id"])
+        return
+    if d.startswith("ct:"):
+        return await ask(ctx, uid, "a_card_owner", "👤 Karta egasining ismini yozing:", kind=d[3:])
+    if d.startswith("kd:"):
+        x("DELETE FROM cards WHERE id=?", (int(d[3:]),))
+        return await say(ctx, uid, "🗑 Karta o'chirildi.", amenu(CARD_MENU))
+    if d.startswith("pk:"):
+        fl = ctx.user_data.get("flow")
+        if fl and fl["k"] == "a_p_kind":
+            fl["kind"] = d[3:]
+            p = ("💵 Necha so'm beriladi?" if fl["kind"] == "amount"
+                 else "⏳ Obuna necha kun faol bo'ladi?")
+            fl["k"], fl["p"] = "a_p_val", p
+            await say(ctx, uid, p, back_kb())
+        return
+    if d.startswith(("po:", "pn:")):
+        _, pid, pager = d.split(":")
+        return await pay_decide(ctx, uid, int(pid), d.startswith("po:"), pager == "1")
+    if d.startswith("cp:"):
+        return await a_comp(ctx, uid, int(d[3:]))
+    if d.startswith(("cv:", "cr:")):
+        _, cid, idx = d.split(":")
+        return await comp_decide(ctx, uid, int(cid), int(idx), d.startswith("cv:"))
+    if d.startswith("cb:"):
+        _, rid, idx = d.split(":")
+        await ban_user(ctx, int(rid))
+        await ctx.bot.send_message(uid, f"🚫 {rid} bloklandi.")
+        return await a_comp(ctx, uid, int(idx))
+    if d.startswith("sc:"):
+        g = d[3:]
+        v = SI("boy_pct" if g == "yigit" else "girl_pct", 50)
+        ctx.user_data.setdefault("tmp", {})[g] = v
+        return await say(ctx, uid, pct_text(g, v), pct_kb(ctx, uid, g, v))
+    if d.startswith(("sp:", "sm:")):
+        g = d[3:]
+        tmp = ctx.user_data.setdefault("tmp", {})
+        v = tmp.get(g, SI("boy_pct" if g == "yigit" else "girl_pct", 50))
+        v = max(0, min(100, v + (1 if d.startswith("sp:") else -1)))
+        tmp[g] = v
+        if qy is not None and is_modern():
+            try:
+                await qy.edit_message_text(pct_text(g, v), reply_markup=pct_kb(ctx, uid, g, v), parse_mode=HTML)
+            except Exception:
+                pass
+        else:
+            await say(ctx, uid, pct_text(g, v), pct_kb(ctx, uid, g, v))
+        return
+    if d.startswith("sd:"):
+        g = d[3:]
+        v = ctx.user_data.get("tmp", {}).get(g, SI("boy_pct" if g == "yigit" else "girl_pct", 50))
+        setS("boy_pct" if g == "yigit" else "girl_pct", v)
+        return await a_srch(ctx, uid)
+
+
+# ============================ ROUTERLAR ==============================
+USER_ACTIONS = {
+    M_SEARCH: lambda c, u: u_search(c, u),
+    M_BOY: lambda c, u: u_gender(c, u, "yigit"),
+    M_GIRL: lambda c, u: u_gender(c, u, "qiz"),
+    M_ACC: u_acc, M_FORM: u_form, M_PROF: u_prof, M_TOP: u_topup, M_REF: u_ref, M_PROMO: u_promo,
+}
+ADMIN_CB = ("a:", "em:", "xd:", "xa:", "ct:", "kd:", "pk:", "po:", "pn:", "cp:", "cv:", "cr:", "cb:",
+            "sc:", "sp:", "sm:", "sd:")
+
+
+async def pre(update, ctx):
+    """Har bir yangilanishdan oldin: foydalanuvchini yozish, ban tekshirish, holatni tozalash."""
+    tu = update.effective_user
+    if not tu or tu.is_bot:
+        return
+    u = ensure_user(update)
+    m = update.message
+    if m and m.text and m.text.startswith("/"):
+        ctx.user_data.pop("flow", None)
+    if u["banned"] and tu.id not in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(tu.id, block_text(), parse_mode=HTML)
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
+
+
+async def on_message(update, ctx):
+    m = update.message
+    if not m:
+        return
+    uid = update.effective_user.id
+    u = U(uid)
+    if uid in ctx.bot_data["pairs"]:
+        return await relay(update, ctx)
+    text = canon((m.text or "").strip())
+    if text == M_STOP:
+        await eat(update)
+        return await main_menu(ctx, uid)
+    if text == M_CANCEL:
+        fl = ctx.user_data.pop("flow", None)
+        mid = ctx.bot_data.setdefault("inv", {}).pop(uid, None)
+        if mid:  # Stars to'lov oynasi bekor qilinganda olib tashlanadi
+            try:
+                await ctx.bot.delete_message(uid, mid)
+            except Exception:
+                pass
+        if fl and fl["k"].startswith("a_") and uid in ADMIN_IDS:
+            return await a_home(ctx, uid)
+        return await main_menu(ctx, uid, "❌ Bekor qilindi.")
+    if text == M_ADMIN and uid in ADMIN_IDS:
+        ctx.user_data.pop("flow", None)
+        await eat(update)
+        return await a_home(ctx, uid)
+    if text in USER_ACTIONS:
+        ctx.user_data.pop("flow", None)
+        await eat(update)
+        if not u["registered"]:
+            return await need_reg(ctx, uid)
+        return await USER_ACTIONS[text](ctx, uid)
+    if text in ALL_ADMIN and uid in ADMIN_IDS:
+        await eat(update)
+        return await adm(ctx, uid, ALL_ADMIN[text])
+    rk = ctx.bot_data.get("rk", {}).get(uid)
+    if rk and text in rk and uid in ADMIN_IDS:
+        await eat(update)
+        return await admin_cb(ctx, uid, rk[text], None)
+    fl = ctx.user_data.get("flow")
+    if fl:
+        if fl["k"].startswith("a_") and uid in ADMIN_IDS:
+            return await admin_flow(update, ctx, fl)
+        return await user_flow(update, ctx, fl)
+    # Boshqa xabarlar (jumladan suhbat so'zlari) hech qachon o'chirilmaydi.
+
+
+async def on_cb(update, ctx):
+    qy = update.callback_query
+    d = qy.data or ""
+    uid = update.effective_user.id
+    await qy.answer()
+    if d == "noop":
+        return
+    is_admin_cb = d.startswith(ADMIN_CB)
+    if is_admin_cb and uid not in ADMIN_IDS:
+        return
+    if CLEAN_CHAT and not d.startswith(("sp:", "sm:")) and d != "offer":
+        try:
+            await qy.message.delete()
+        except Exception:
+            pass
+    u = U(uid)
+    if is_admin_cb:
+        return await admin_cb(ctx, uid, d, qy)
+    if d == "offer":
+        x("UPDATE users SET offer=1 WHERE id=?", (uid,))
+        try:
+            if DELETE_OFFER:
+                await qy.message.delete()
+            else:
+                await qy.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return await reg_start(ctx, uid)
+    if d.startswith("g:"):
+        fl = ctx.user_data.get("flow")
+        if fl and fl["k"] == "reg_gender":
+            fl["gender"], fl["k"] = d[2:], "reg_photo"
+            await say(ctx, uid, REG_PROMPT["reg_photo"])
+        return
+    if d == "adm_reg" and uid in ADMIN_IDS:
+        if not u["offer"]:
+            return await say(ctx, uid, OFFER_TEXT, ikb([[("✅ Roziman", "offer")]]), track=False)
+        return await reg_start(ctx, uid)
+    if d == "adm_skip" and uid in ADMIN_IDS:
+        return await a_home(ctx, uid)
+    if not u["registered"]:
+        return await need_reg(ctx, uid)
+    if d == "chk":
+        if await gate(ctx, uid):
+            await credit_referral(ctx, uid)
+            await main_menu(ctx, uid)
+    elif d.startswith("buy:"):
+        await buy(ctx, uid, d[4:])
+    elif d == "free":
+        await show_free(ctx, uid)
+    elif d == "topup":
+        await u_topup(ctx, uid)
+    elif d.startswith("tp:"):
+        await ask_amount(ctx, uid, d[3:])
+    elif d.startswith("paid:"):
+        await ask_receipt(ctx, uid, int(d[5:]))
+    elif d == "adtog":
+        await toggle_ads(ctx, uid)
+    elif d == "faq":
+        await show_faq(ctx, uid)
+    elif d in FAQ:
+        await show_faq_answer(ctx, uid, d)
+    elif d == "cmp":
+        await start_complaint(ctx, uid)
+    elif d == "nxt":
+        await u_search(ctx, uid)
+
+
+# ============================ BUYRUQLAR ==============================
+async def cmd_stop(update, ctx):
+    uid = update.effective_user.id
+    await eat(update)
+    if not U(uid)["registered"]:
+        return await need_reg(ctx, uid)
+    if uid in ctx.bot_data["pairs"]:
+        return await end_chat(ctx, uid)
+    if await cancel_search(ctx, uid):
+        return await say(ctx, uid, "🛑 Qidiruv bekor qilindi.", UM(uid))
+    await say(ctx, uid, "ℹ️ Siz hozir suhbatda emassiz.", UM(uid))
+
+
+async def cmd_next(update, ctx):
+    uid = update.effective_user.id
+    await eat(update)
+    if not U(uid)["registered"]:
+        return await need_reg(ctx, uid)
+    if uid in ctx.bot_data["pairs"]:
+        await end_chat(ctx, uid, notify_self=False)
+    await u_search(ctx, uid)
+
+
+def simple_cmd(fn):
+    async def handler(update, ctx):
+        uid = update.effective_user.id
+        await eat(update)
+        if not U(uid)["registered"]:
+            return await need_reg(ctx, uid)
+        await fn(ctx, uid)
+    return handler
+
+
+async def cmd_vip(ctx, uid):
+    await show_sub(ctx, uid, "vip")
+
+
+async def cmd_link(ctx, uid):
+    await show_sub(ctx, uid, "link")
+
+
+async def cmd_admin(update, ctx):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        return
+    await eat(update)
+    ctx.user_data.pop("flow", None)
+    await a_home(ctx, uid)
+
+
+# ============================ STARS TO'LOVI ==========================
+async def precheckout(update, ctx):
+    await update.pre_checkout_query.answer(ok=True)
+
+
+async def on_paid(update, ctx):
+    uid = update.effective_user.id
+    p = update.message.successful_payment
+    try:
+        amt = int(p.invoice_payload.split(":")[2])
+    except (IndexError, ValueError):
+        return
+    x("UPDATE users SET balance=balance+?, deposited=deposited+? WHERE id=?", (amt, amt, uid))
+    ctx.bot_data.get("inv", {}).pop(uid, None)
+    await say(ctx, uid, f"✅ Hisobingiz <b>{money(amt)}</b> so'mga to'ldirildi!", UM(uid))
+
+
+# ============================ ISHGA TUSHIRISH ========================
+async def weekly_awards(app):
+    """Har dushanba o'tgan haftaning top 3 referalchisiga sovrinni avtomatik beradi."""
+    while True:
+        try:
+            ws = week_start()
+            last = S("award_week")
+            if last is None:
+                setS("award_week", ws)
+            elif float(last) < ws:
+                lines = []
+                for i, r in enumerate(weekly_top(float(last), ws, 3), 1):
+                    days = SI(f"prize_{i}")
+                    if days > 0:
+                        add_days(r["referrer"], "vip_until", days)
+                        add_days(r["referrer"], "link_until", days)
+                        try:
+                            await app.bot.send_message(
+                                r["referrer"], f"🏆 Tabriklaymiz! Siz o'tgan haftaning {i}-o'rnini egalladingiz. "
+                                               f"Sizga {days} kunlik VIP va link obunasi berildi!")
+                        except Exception:
+                            pass
+                    lines.append(f"{i}. {r['name']} — {r['c']} ta (+{days} kun)")
+                setS("award_week", ws)
+                for a in ADMIN_IDS:
+                    if lines:
+                        try:
+                            await app.bot.send_message(a, "🏆 Haftalik reyting sovrinlari berildi:\n" + "\n".join(lines))
+                        except Exception:
+                            pass
+        except Exception as e:
+            logging.warning("weekly awards error: %s", e)
+        await asyncio.sleep(600)
+
+
+async def post_init(app):
+    app.bot_data.update(pairs={}, wait=[], last={}, lock=asyncio.Lock())
+    app.bot_data["matcher_task"] = asyncio.create_task(matcher(app))
+    app.bot_data["awards_task"] = asyncio.create_task(weekly_awards(app))
+
+
+async def on_error(update, ctx):
+    logging.error("Xatolik: %s", ctx.error, exc_info=ctx.error)
+
+
+def main():
+    if BOT_TOKEN.startswith("BOT_TOKENNI"):
+        raise SystemExit("main.py ichidagi BOT_TOKEN ga bot tokenini yozing (yoki BOT_TOKEN muhit o'zgaruvchisi).")
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(TypeHandler(Update, pre), group=-1)
+    app.add_error_handler(on_error)
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("next", cmd_next))
+    app.add_handler(CommandHandler("vip", simple_cmd(cmd_vip)))
+    app.add_handler(CommandHandler("link", simple_cmd(cmd_link)))
+    app.add_handler(CommandHandler("settings", simple_cmd(show_settings)))
+    app.add_handler(CommandHandler("rules", simple_cmd(show_rules)))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(PreCheckoutQueryHandler(precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_paid))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message))
+    print("Bot ishga tushdi...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
